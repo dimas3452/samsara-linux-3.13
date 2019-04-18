@@ -547,6 +547,31 @@ struct kvm_ppc_smmu_info {
 #define KVM_TRACE_DISABLE         __KVM_DEPRECATED_MAIN_0x08
 #define KVM_GET_EMULATED_CPUID	  _IOWR(KVMIO, 0x09, struct kvm_cpuid2)
 
+/* Record and replay control */
+#define KVM_RR_CTRL		_IO(KVMIO, 0x09)
+
+struct kvm_rr_ctrl {
+	__u16 enabled;
+	__u16 ctrl;
+	__u32 timer_value;
+};
+
+/* Decide how to get accessed memory */
+#define KVM_RR_CTRL_MEM_MASK		0x7U
+#define KVM_RR_CTRL_MEM_SOFTWARE	0x0U
+#define KVM_RR_CTRL_MEM_EPT		0x1U
+#define KVM_RR_CTRL_MEM_MEMSLOT		0x2U
+
+/* Decide record and replay mode */
+#define KVM_RR_CTRL_MODE_MASK		(0x3U << 3)
+#define KVM_RR_CTRL_MODE_SYNC		0x0U
+#define KVM_RR_CTRL_MODE_ASYNC		(0x1U << 3)
+
+/* Decide how to kick vcpu */
+#define KVM_RR_CTRL_KICK_MASK		(0x3U << 5)
+#define KVM_RR_CTRL_KICK_PREEMPTION	0x0U
+#define KVM_RR_CTRL_KICK_TIMER		(0x1U << 5)
+
 /*
  * Extension capability list.
  */
@@ -872,6 +897,19 @@ struct kvm_device_attr {
 					struct kvm_userspace_memory_region)
 #define KVM_SET_TSS_ADDR          _IO(KVMIO,   0x47)
 #define KVM_SET_IDENTITY_MAP_ADDR _IOW(KVMIO,  0x48, __u64)
+/* Record and replay */
+#define KVM_DMA_COMMIT            _IOWR(KVMIO, 0x49, struct rr_dma_info)
+
+#define RR_DMA_START	0
+#define RR_DMA_FINISH	1
+#define RR_DMA_SET_DATA	2
+
+#define RR_DMA_INFO_GFN_SIZE	32
+struct rr_dma_info {
+	int cmd;
+	int size;
+	__u32 gfn[RR_DMA_INFO_GFN_SIZE];
+};
 
 /* enable ucontrol for s390 */
 struct kvm_s390_ucas_mapping {
