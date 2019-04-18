@@ -398,30 +398,25 @@ int kvm_lapic_find_highest_irr(struct kvm_vcpu *vcpu)
 	return highest_irr;
 }
 
-static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
-			     int vector, int level, int trig_mode,
-			     unsigned long *dest_map);
-
 int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
 		unsigned long *dest_map)
 {
 	struct kvm_lapic *apic = vcpu->arch.apic;
 
-	return __apic_accept_irq(apic, irq->delivery_mode, irq->vector,
-			irq->level, irq->trig_mode, dest_map);
+	return rr_apic_accept_irq(apic, irq->delivery_mode, irq->vector,
+				  irq->level, irq->trig_mode, dest_map);
 }
 
 static int pv_eoi_put_user(struct kvm_vcpu *vcpu, u8 val)
 {
-
-	return kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.pv_eoi.data, &val,
+	return kvm_write_guest_cached(vcpu, &vcpu->arch.pv_eoi.data, &val,
 				      sizeof(val));
 }
 
 static int pv_eoi_get_user(struct kvm_vcpu *vcpu, u8 *val)
 {
 
-	return kvm_read_guest_cached(vcpu->kvm, &vcpu->arch.pv_eoi.data, val,
+	return kvm_read_guest_cached(vcpu, &vcpu->arch.pv_eoi.data, val,
 				      sizeof(*val));
 }
 
@@ -659,9 +654,9 @@ out:
  * Add a pending IRQ into lapic.
  * Return 1 if successfully added and 0 if discarded.
  */
-static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
-			     int vector, int level, int trig_mode,
-			     unsigned long *dest_map)
+int apic_accept_irq_without_record(struct kvm_lapic *apic, int delivery_mode,
+				   int vector, int level, int trig_mode,
+				   unsigned long *dest_map)
 {
 	int result = 0;
 	struct kvm_vcpu *vcpu = apic->vcpu;
@@ -751,6 +746,7 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
 	}
 	return result;
 }
+EXPORT_SYMBOL_GPL(apic_accept_irq_without_record);
 
 int kvm_apic_compare_prio(struct kvm_vcpu *vcpu1, struct kvm_vcpu *vcpu2)
 {
@@ -1469,8 +1465,8 @@ int kvm_apic_local_deliver(struct kvm_lapic *apic, int lvt_type)
 		vector = reg & APIC_VECTOR_MASK;
 		mode = reg & APIC_MODE_MASK;
 		trig_mode = reg & APIC_LVT_LEVEL_TRIGGER;
-		return __apic_accept_irq(apic, mode, vector, 1, trig_mode,
-					NULL);
+		return rr_apic_accept_irq(apic, mode, vector, 1, trig_mode,
+					  NULL);
 	}
 	return 0;
 }
