@@ -31,6 +31,8 @@
 
 #include <linux/kvm_types.h>
 
+#include <linux/record_replay.h>
+
 #include <asm/kvm_host.h>
 
 #ifndef KVM_MMIO_SIZE
@@ -144,6 +146,9 @@ extern struct kmem_cache *kvm_vcpu_cache;
 
 extern spinlock_t kvm_lock;
 extern struct list_head vm_list;
+
+/* Record and replay */
+extern struct kvm_rr_ctrl rr_ctrl;
 
 struct kvm_io_range {
 	gpa_t addr;
@@ -271,6 +276,8 @@ struct kvm_vcpu {
 #endif
 	bool preempted;
 	struct kvm_vcpu_arch arch;
+	/* Record and replay */
+	struct rr_vcpu_info rr_info;
 };
 
 static inline int kvm_vcpu_exiting_guest_mode(struct kvm_vcpu *vcpu)
@@ -405,6 +412,9 @@ struct kvm {
 #endif
 	long tlbs_dirty;
 	struct list_head devices;
+
+	/* Record and replay */
+	struct rr_kvm_info rr_info;
 };
 
 #define kvm_err(fmt, ...) \
@@ -596,6 +606,10 @@ long kvm_arch_dev_ioctl(struct file *filp,
 			unsigned int ioctl, unsigned long arg);
 long kvm_arch_vcpu_ioctl(struct file *filp,
 			 unsigned int ioctl, unsigned long arg);
+
+/* Record and replay */
+int rr_vcpu_make_checkpoint(struct kvm_vcpu *vcpu, int type, void *arg);
+
 int kvm_arch_vcpu_fault(struct kvm_vcpu *vcpu, struct vm_fault *vmf);
 
 int kvm_dev_ioctl_check_extension(long ext);

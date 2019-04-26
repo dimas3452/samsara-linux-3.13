@@ -3356,8 +3356,8 @@ static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
 	return false;
 }
 
-static int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
-			  bool prefault)
+int tdp_page_fault(struct kvm_vcpu *vcpu, gva_t gpa, u32 error_code,
+		   bool prefault)
 {
 	pfn_t pfn;
 	int r;
@@ -3418,6 +3418,7 @@ out_unlock:
 	kvm_release_pfn_clean(pfn);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(tdp_page_fault);
 
 static void nonpaging_init_context(struct kvm_vcpu *vcpu,
 				   struct kvm_mmu *context)

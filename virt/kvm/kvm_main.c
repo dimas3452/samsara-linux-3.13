@@ -49,11 +49,13 @@
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/bsearch.h>
+#include <linux/record_replay.h>
 
 #include <asm/processor.h>
 #include <asm/io.h>
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
+#include <asm/logger.h>
 
 #include "coalesced_mmio.h"
 #include "async_pf.h"
@@ -80,6 +82,10 @@ static atomic_t hardware_enable_failed;
 
 struct kmem_cache *kvm_vcpu_cache;
 EXPORT_SYMBOL_GPL(kvm_vcpu_cache);
+
+/* Record and replay */
+struct kvm_rr_ctrl rr_ctrl;
+EXPORT_SYMBOL_GPL(rr_ctrl);
 
 static __read_mostly struct preempt_ops kvm_preempt_ops;
 
