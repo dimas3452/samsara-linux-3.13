@@ -420,7 +420,7 @@ int kvm_read_guest_page_mmu(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
 
 	real_gfn = gpa_to_gfn(real_gfn);
 
-	return kvm_read_guest_page(vcpu->kvm, real_gfn, data, offset, len);
+	return kvm_read_guest_page(vcpu, real_gfn, data, offset, len);
 }
 EXPORT_SYMBOL_GPL(kvm_read_guest_page_mmu);
 
@@ -990,17 +990,18 @@ static void update_pvclock_gtod(struct timekeeper *tk)
 #endif
 
 
-static void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock)
+static void kvm_write_wall_clock(struct kvm_vcpu *vcpu, gpa_t wall_clock)
 {
 	int version;
 	int r;
 	struct pvclock_wall_clock wc;
 	struct timespec boot;
+	struct kvm *kvm = vcpu->kvm;
 
 	if (!wall_clock)
 		return;
 
-	r = kvm_read_guest(kvm, wall_clock, &version, sizeof(version));
+	r = kvm_read_guest(vcpu, wall_clock, &version, sizeof(version));
 	if (r)
 		return;
 
@@ -1009,7 +1010,7 @@ static void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock)
 
 	++version;
 
-	kvm_write_guest(kvm, wall_clock, &version, sizeof(version));
+	kvm_write_guest(vcpu, wall_clock, &version, sizeof(version));
 
 	/*
 	 * The guest calculates current wall clock time by adding
@@ -1027,10 +1028,10 @@ static void kvm_write_wall_clock(struct kvm *kvm, gpa_t wall_clock)
 	wc.nsec = boot.tv_nsec;
 	wc.version = version;
 
-	kvm_write_guest(kvm, wall_clock, &wc, sizeof(wc));
+	kvm_write_guest(vcpu, wall_clock, &wc, sizeof(wc));
 
 	version++;
-	kvm_write_guest(kvm, wall_clock, &version, sizeof(version));
+	kvm_write_guest(vcpu, wall_clock, &version, sizeof(version));
 }
 
 static uint32_t div_frac(uint32_t dividend, uint32_t divisor)
@@ -1603,7 +1604,7 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 	 */
 	vcpu->hv_clock.version += 2;
 
-	if (unlikely(kvm_read_guest_cached(v->kvm, &vcpu->pv_time,
+	if (unlikely(kvm_read_guest_cached(v, &vcpu->pv_time,
 		&guest_hv_clock, sizeof(guest_hv_clock))))
 		return 0;
 
@@ -1620,8 +1621,7 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 		pvclock_flags |= PVCLOCK_TSC_STABLE_BIT;
 
 	vcpu->hv_clock.flags = pvclock_flags;
-
-	kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
+	kvm_write_guest_cached(v, &vcpu->pv_time,
 				&vcpu->hv_clock,
 				sizeof(vcpu->hv_clock));
 	return 0;
@@ -1807,7 +1807,7 @@ static int xen_hvm_config(struct kvm_vcpu *vcpu, u64 data)
 		r = PTR_ERR(page);
 		goto out;
 	}
-	if (kvm_write_guest(kvm, page_addr, page, PAGE_SIZE))
+	if (kvm_write_guest(vcpu, page_addr, page, PAGE_SIZE))
 		goto out_free;
 	r = 0;
 out_free:
@@ -1957,15 +1957,14 @@ static void record_steal_time(struct kvm_vcpu *vcpu)
 	if (!(vcpu->arch.st.msr_val & KVM_MSR_ENABLED))
 		return;
 
-	if (unlikely(kvm_read_guest_cached(vcpu->kvm, &vcpu->arch.st.stime,
+	if (unlikely(kvm_read_guest_cached(vcpu, &vcpu->arch.st.stime,
 		&vcpu->arch.st.steal, sizeof(struct kvm_steal_time))))
 		return;
 
 	vcpu->arch.st.steal.steal += vcpu->arch.st.accum_steal;
 	vcpu->arch.st.steal.version += 2;
 	vcpu->arch.st.accum_steal = 0;
-
-	kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.st.stime,
+	kvm_write_guest_cached(vcpu, &vcpu->arch.st.stime,
 		&vcpu->arch.st.steal, sizeof(struct kvm_steal_time));
 }
 
@@ -2040,7 +2039,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	case MSR_KVM_WALL_CLOCK_NEW:
 	case MSR_KVM_WALL_CLOCK:
 		vcpu->kvm->arch.wall_clock = data;
-		kvm_write_wall_clock(vcpu->kvm, data);
+		kvm_write_wall_clock(vcpu, data);
 		break;
 	case MSR_KVM_SYSTEM_TIME_NEW:
 	case MSR_KVM_SYSTEM_TIME: {
@@ -4134,7 +4133,7 @@ static int kvm_read_guest_virt_helper(gva_t addr, void *val, unsigned int bytes,
 
 		if (gpa == UNMAPPED_GVA)
 			return X86EMUL_PROPAGATE_FAULT;
-		ret = kvm_read_guest(vcpu->kvm, gpa, data, toread);
+		ret = kvm_read_guest(vcpu, gpa, data, toread);
 		if (ret < 0) {
 			r = X86EMUL_IO_NEEDED;
 			goto out;
@@ -4200,7 +4199,7 @@ int kvm_write_guest_virt_system(struct x86_emulate_ctxt *ctxt,
 
 		if (gpa == UNMAPPED_GVA)
 			return X86EMUL_PROPAGATE_FAULT;
-		ret = kvm_write_guest(vcpu->kvm, gpa, data, towrite);
+		ret = kvm_write_guest(vcpu, gpa, data, towrite);
 		if (ret < 0) {
 			r = X86EMUL_IO_NEEDED;
 			goto out;
@@ -4252,7 +4251,7 @@ int emulator_write_phys(struct kvm_vcpu *vcpu, gpa_t gpa,
 {
 	int ret;
 
-	ret = kvm_write_guest(vcpu->kvm, gpa, val, bytes);
+	ret = kvm_write_guest(vcpu, gpa, val, bytes);
 	if (ret < 0)
 		return 0;
 	kvm_mmu_pte_write(vcpu, gpa, val, bytes);
@@ -4286,7 +4285,7 @@ static int read_prepare(struct kvm_vcpu *vcpu, void *val, int bytes)
 static int read_emulate(struct kvm_vcpu *vcpu, gpa_t gpa,
 			void *val, int bytes)
 {
-	return !kvm_read_guest(vcpu->kvm, gpa, val, bytes);
+	return !kvm_read_guest(vcpu, gpa, val, bytes);
 }
 
 static int write_emulate(struct kvm_vcpu *vcpu, gpa_t gpa,
@@ -7486,8 +7485,7 @@ static void kvm_del_async_pf_gfn(struct kvm_vcpu *vcpu, gfn_t gfn)
 
 static int apf_put_user(struct kvm_vcpu *vcpu, u32 val)
 {
-
-	return kvm_write_guest_cached(vcpu->kvm, &vcpu->arch.apf.data, &val,
+	return kvm_write_guest_cached(vcpu, &vcpu->arch.apf.data, &val,
 				      sizeof(val));
 }
 

@@ -40,6 +40,7 @@
 #include <asm/cmpxchg.h>
 #include <asm/io.h>
 #include <asm/vmx.h>
+#include <asm/logger.h>
 
 /*
  * When setting this variable to true it enables Two-Dimensional-Paging
@@ -321,12 +322,12 @@ static int is_nx(struct kvm_vcpu *vcpu)
 	return vcpu->arch.efer & EFER_NX;
 }
 
-static int is_shadow_present_pte(u64 pte)
+static int inline is_shadow_present_pte(u64 pte)
 {
 	return pte & PT_PRESENT_MASK && !is_mmio_spte(pte);
 }
 
-static int is_large_pte(u64 pte)
+static int inline is_large_pte(u64 pte)
 {
 	return pte & PT_PAGE_SIZE_MASK;
 }
@@ -336,7 +337,7 @@ static int is_rmap_spte(u64 pte)
 	return is_shadow_present_pte(pte);
 }
 
-static int is_last_spte(u64 pte, int level)
+static int inline is_last_spte(u64 pte, int level)
 {
 	if (level == PT_PAGE_TABLE_LEVEL)
 		return 1;
@@ -3934,7 +3935,7 @@ static u64 mmu_pte_write_fetch_gpte(struct kvm_vcpu *vcpu, gpa_t *gpa,
 		/* Handle a 32-bit guest writing two halves of a 64-bit gpte */
 		*gpa &= ~(gpa_t)7;
 		*bytes = 8;
-		r = kvm_read_guest(vcpu->kvm, *gpa, &gentry, 8);
+		r = kvm_read_guest(vcpu, *gpa, &gentry, 8);
 		if (r)
 			gentry = 0;
 		new = (const u8 *)&gentry;

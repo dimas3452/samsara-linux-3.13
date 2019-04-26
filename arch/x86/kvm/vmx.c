@@ -3809,8 +3809,8 @@ static int init_rmode_tss(struct kvm *kvm)
 	if (r < 0)
 		goto out;
 	data = TSS_BASE_SIZE + TSS_REDIRECTION_SIZE;
-	r = kvm_write_guest_page(kvm, fn++, &data,
-			TSS_IOPB_BASE_OFFSET, sizeof(u16));
+	r = kvm_write_guest_page_kvm(kvm, fn++, &data,
+				     TSS_IOPB_BASE_OFFSET, sizeof(u16));
 	if (r < 0)
 		goto out;
 	r = kvm_clear_guest_page(kvm, fn++, 0, PAGE_SIZE);
@@ -3820,9 +3820,9 @@ static int init_rmode_tss(struct kvm *kvm)
 	if (r < 0)
 		goto out;
 	data = ~0;
-	r = kvm_write_guest_page(kvm, fn, &data,
-				 RMODE_TSS_SIZE - 2 * PAGE_SIZE - 1,
-				 sizeof(u8));
+	r = kvm_write_guest_page_kvm(kvm, fn, &data,
+				     RMODE_TSS_SIZE - 2 * PAGE_SIZE - 1,
+				     sizeof(u8));
 	if (r < 0)
 		goto out;
 
@@ -3857,8 +3857,8 @@ static int init_rmode_identity_map(struct kvm *kvm)
 	for (i = 0; i < PT32_ENT_PER_PAGE; i++) {
 		tmp = (i << 22) + (_PAGE_PRESENT | _PAGE_RW | _PAGE_USER |
 			_PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_PSE);
-		r = kvm_write_guest_page(kvm, identity_map_pfn,
-				&tmp, i * sizeof(tmp), sizeof(tmp));
+		r = kvm_write_guest_page_kvm(kvm, identity_map_pfn, &tmp,
+					     i * sizeof(tmp), sizeof(tmp));
 		if (r < 0)
 			goto out;
 	}
@@ -6484,7 +6484,7 @@ static bool nested_vmx_exit_handled_io(struct kvm_vcpu *vcpu,
 		bitmap += (port & 0x7fff) / 8;
 
 		if (last_bitmap != bitmap)
-			if (kvm_read_guest(vcpu->kvm, bitmap, &b, 1))
+			if (kvm_read_guest(vcpu, bitmap, &b, 1))
 				return 1;
 		if (b & (1 << (port & 7)))
 			return 1;
@@ -6528,7 +6528,7 @@ static bool nested_vmx_exit_handled_msr(struct kvm_vcpu *vcpu,
 	/* Then read the msr_index'th bit from this bitmap: */
 	if (msr_index < 1024*8) {
 		unsigned char b;
-		if (kvm_read_guest(vcpu->kvm, bitmap + msr_index/8, &b, 1))
+		if (kvm_read_guest(vcpu, bitmap + msr_index/8, &b, 1))
 			return 1;
 		return 1 & (b >> (msr_index & 7));
 	} else
