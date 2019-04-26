@@ -237,6 +237,8 @@ int kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
 	r = kvm_arch_vcpu_init(vcpu);
 	if (r < 0)
 		goto fail_free_run;
+
+	rr_vcpu_info_init(vcpu);
 	return 0;
 
 fail_free_run:
@@ -502,6 +504,7 @@ static struct kvm *kvm_create_vm(unsigned long type)
 	list_add(&kvm->vm_list, &vm_list);
 	spin_unlock(&kvm_lock);
 
+	rr_kvm_info_init(kvm);
 	return kvm;
 
 out_err:
@@ -1444,10 +1447,31 @@ int kvm_read_guest_page(struct kvm_vcpu *vcpu, gfn_t gfn, void *data, int offset
 	struct kvm *kvm = vcpu->kvm;
 	int r;
 	unsigned long addr;
+	void *kaddr;
 
 	addr = gfn_to_hva_prot(kvm, gfn, NULL);
-	if (kvm_is_error_hva(addr))
+	if (unlikely(kvm_is_error_hva(addr)))
 		return -EFAULT;
+
+	if (likely(vcpu->rr_info.enabled)) {
+		kaddr = rr_ept_gfn_to_kaddr(vcpu, gfn, 0);
+		if (unlikely(kaddr == NULL)) {
+			RR_ERR("error: vcpu=%d fail to get addr via "
+			       "ept for gfn 0x%llx, offset 0x%x",
+			       vcpu->vcpu_id, gfn, offset);
+			r = kvm_read_hva(data, (void __user *)addr + offset,
+					 len);
+			if (r) {
+				return -EFAULT;
+			}
+			RR_ERR("error: vcpu=%d fix it for gfn 0x%llx",
+			       vcpu->vcpu_id, gfn);
+			return 0;
+		}
+		memcpy(data, kaddr + offset, len);
+		return 0;
+	}
+
 	r = kvm_read_hva(data, (void __user *)addr + offset, len);
 	if (r)
 		return -EFAULT;
@@ -1502,6 +1526,8 @@ int kvm_write_guest_page_kvm(struct kvm *kvm, gfn_t gfn, const void *data,
 	int r;
 	unsigned long addr;
 
+	/* We assume that this function will not be called when recording */
+	RR_ASSERT(!kvm->rr_info.enabled);
 	addr = gfn_to_hva(kvm, gfn);
 	if (kvm_is_error_hva(addr))
 		return -EFAULT;
@@ -1623,6 +1649,9 @@ int kvm_write_guest_cached(struct kvm_vcpu *vcpu, struct gfn_to_hva_cache *ghc,
 	if (slots->generation != ghc->generation)
 		kvm_gfn_to_hva_cache_init(kvm, ghc, ghc->gpa, ghc->len);
 
+	if (vcpu->rr_info.enabled)
+		return kvm_write_guest(vcpu, ghc->gpa, data, len);
+
 	if (unlikely(!ghc->memslot))
 		return kvm_write_guest(vcpu, ghc->gpa, data, len);
 
@@ -1649,6 +1678,9 @@ int kvm_read_guest_cached(struct kvm_vcpu *vcpu, struct gfn_to_hva_cache *ghc,
 
 	if (slots->generation != ghc->generation)
 		kvm_gfn_to_hva_cache_init(kvm, ghc, ghc->gpa, ghc->len);
+
+	if (vcpu->rr_info.enabled)
+		return kvm_read_guest(vcpu, ghc->gpa, data, len);
 
 	if (unlikely(!ghc->memslot))
 		return kvm_read_guest(vcpu, ghc->gpa, data, len);
@@ -1953,6 +1985,56 @@ static struct file_operations kvm_vcpu_fops = {
 static int create_vcpu_fd(struct kvm_vcpu *vcpu)
 {
 	return anon_inode_getfd("kvm-vcpu", &kvm_vcpu_fops, vcpu, O_RDWR | O_CLOEXEC);
+}
+
+static void rr_set_dma_bitmap(struct kvm *kvm, struct rr_dma_info *dma_info,
+			      int online_vcpus)
+{
+	struct region_bitmap *rbitmap;
+	int i, j;
+	int gfn_size = dma_info->size;
+
+	for (i = 0; i < online_vcpus; ++i) {
+		rbitmap = kvm->vcpus[i]->rr_info.public_cb;
+		for (j = 0; j < gfn_size; ++j) {
+			re_set_bit(dma_info->gfn[j], rbitmap);
+		}
+	}
+}
+
+/* Record and replay */
+static int rr_kvm_vm_ioctl_set_dma_info(struct kvm *kvm,
+					struct rr_dma_info *dma_info)
+{
+	int online_vcpus = atomic_read(&(kvm->online_vcpus));
+	struct rr_kvm_info *krr_info = &kvm->rr_info;
+
+	switch (dma_info->cmd) {
+	case RR_DMA_SET_DATA: {
+		if (unlikely(!krr_info->dma_holding_sem)) {
+			break;
+		}
+		rr_set_dma_bitmap(kvm, dma_info, online_vcpus);
+		break;
+	}
+	case RR_DMA_START:
+		down_write(&krr_info->tm_rwlock);
+		krr_info->dma_holding_sem = true;
+		break;
+	case RR_DMA_FINISH:
+		if (unlikely(!krr_info->dma_holding_sem)) {
+			break;
+		}
+		if (dma_info->size > 0)
+			rr_set_dma_bitmap(kvm, dma_info, online_vcpus);
+		krr_info->dma_holding_sem = false;
+		/* Let the vcpu that committed last time to check conflict */
+		up_write(&krr_info->tm_rwlock);
+		break;
+	default:
+		break;
+	}
+	return 0;
 }
 
 /*
@@ -2387,10 +2469,28 @@ static long kvm_vm_ioctl(struct file *filp,
 	struct kvm *kvm = filp->private_data;
 	void __user *argp = (void __user *)arg;
 	int r;
+	struct rr_dma_info rr_dma_info;
 
 	if (kvm->mm != current->mm)
 		return -EIO;
 	switch (ioctl) {
+	/* Record and replay */
+	case KVM_DMA_COMMIT: {
+		if (unlikely(!kvm->rr_info.enabled)) {
+			if(kvm->rr_info.dma_holding_sem) {
+				/* DMA is holding the sem after disabling. */
+				up_write(&kvm->rr_info.tm_rwlock);
+				kvm->rr_info.dma_holding_sem = false;
+			}
+			return 0;
+		}
+		r = -EFAULT;
+		if (copy_from_user(&rr_dma_info, argp, sizeof(rr_dma_info)))
+			goto out;
+
+		r = rr_kvm_vm_ioctl_set_dma_info(kvm, &rr_dma_info);
+		break;
+	}
 	case KVM_CREATE_VCPU:
 		r = kvm_vm_ioctl_create_vcpu(kvm, arg);
 		break;
@@ -2659,6 +2759,8 @@ static long kvm_dev_ioctl(struct file *filp,
 			  unsigned int ioctl, unsigned long arg)
 {
 	long r = -EINVAL;
+	void __user *argp = (void __user *)arg;
+	struct kvm_rr_ctrl rr_ctrl_user;
 
 	switch (ioctl) {
 	case KVM_GET_API_VERSION:
@@ -2670,6 +2772,33 @@ static long kvm_dev_ioctl(struct file *filp,
 	case KVM_CREATE_VM:
 		r = kvm_dev_ioctl_create_vm(arg);
 		break;
+
+	case KVM_RR_CTRL:
+		if (copy_from_user(&rr_ctrl_user, argp, sizeof(rr_ctrl_user))) {
+			r = -EFAULT;
+			break;
+		}
+		r = 0;
+		if (rr_ctrl_user.enabled == 0) {
+			/* Disable recording */
+			rr_ctrl = rr_ctrl_user;
+			printk(KERN_INFO "KVM_RR_CTRL, disabled\n");
+			RR_DLOG(INIT, "KVM_RR_CTRL, disabled");
+		} else {
+			/* Enable recording */
+			if (rr_ctrl.enabled == 0) {
+				rr_ctrl = rr_ctrl_user;
+				printk(KERN_INFO "KVM_RR_CTRL, enabled with "
+				       "ctrl: 0x%x, timer_value: %d\n",
+				       rr_ctrl.ctrl, rr_ctrl.timer_value);
+				RR_DLOG(INIT, "KVM_RR_CTRL, enabled with "
+					"ctrl: 0x%x, timer_value: %d",
+					rr_ctrl.ctrl, rr_ctrl.timer_value);
+			} else
+				r = -EBUSY;
+		}
+		break;
+
 	case KVM_CHECK_EXTENSION:
 		r = kvm_dev_ioctl_check_extension_generic(arg);
 		break;

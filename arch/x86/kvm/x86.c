@@ -5975,7 +5975,10 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	bool req_int_win = !irqchip_in_kernel(vcpu->kvm) &&
 		vcpu->run->request_interrupt_window;
 	bool req_immediate_exit = false;
+	struct rr_vcpu_info *vrr_info = &vcpu->rr_info;
+	u64 temp;
 
+restart:
 	if (vcpu->requests) {
 		if (kvm_check_request(KVM_REQ_MMU_RELOAD, vcpu))
 			kvm_mmu_unload(vcpu);
@@ -5993,7 +5996,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		if (kvm_check_request(KVM_REQ_MMU_SYNC, vcpu))
 			kvm_mmu_sync_roots(vcpu);
 		if (kvm_check_request(KVM_REQ_TLB_FLUSH, vcpu))
-			kvm_x86_ops->tlb_flush(vcpu);
+			vrr_info->tlb_flush = true;
 		if (kvm_check_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu)) {
 			vcpu->run->exit_reason = KVM_EXIT_TPR_ACCESS;
 			r = 0;
@@ -6024,6 +6027,19 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 			kvm_deliver_pmi(vcpu);
 		if (kvm_check_request(KVM_REQ_SCAN_IOAPIC, vcpu))
 			vcpu_scan_ioapic(vcpu);
+	}
+
+	/* Enable record and replay */
+	if (unlikely(!vrr_info->enabled && rr_ctrl.enabled)) {
+		rr_vcpu_enable(vcpu);
+	}
+
+	if (rr_check_request(RR_REQ_CHECKPOINT, vrr_info)) {
+		/* We need to read back the value from hardware fpu
+		 * (unload the fpu).
+		 */
+		rr_put_guest_fpu(vcpu);
+		rr_vcpu_checkpoint(vcpu);
 	}
 
 	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win) {
@@ -6061,6 +6077,22 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		goto cancel_injection;
 	}
 
+	/* Need to commit memory here.
+	 * Note: we should NOT clear RR_REQ_COMMIT_AGAIN here because it may
+	 * fail at the first try to enter guest and we need to commit memory
+	 * again until it enters guest.
+	 */
+	if (rr_check_request(RR_REQ_COMMIT_AGAIN, vrr_info)) {
+		rr_commit_again(vcpu);
+	}
+
+	/* Check if we need to wait other vcpus to finish commit/rollback
+	 * memory before we enter guest.
+	 */
+	if (rr_check_request(RR_REQ_POST_CHECK, vrr_info)) {
+		rr_post_check(vcpu);
+	}
+
 	preempt_disable();
 
 	kvm_x86_ops->prepare_guest_switch(vcpu);
@@ -6089,6 +6121,24 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		r = 1;
 		goto cancel_injection;
 	}
+
+	if (vrr_info->tlb_flush) {
+		kvm_x86_ops->tlb_flush(vcpu);
+		vrr_info->tlb_flush = false;
+	}
+
+	if (vrr_info->enabled) {
+		if (likely(vrr_info->cur_exit_time != 0)) {
+			rdtscll(temp);
+			temp -= vrr_info->cur_exit_time;
+			vrr_info->exit_time += temp;
+			vrr_info->exit_stat[vrr_info->exit_reason].time += temp;
+			if (vrr_info->is_write_pf_exit)
+				vrr_info->exit_stat[RR_EXIT_REASON_WRITE_FAULT].time += temp;
+		}
+	}
+
+	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
 
 	if (req_immediate_exit)
 		smp_send_reschedule(vcpu->cpu);
@@ -6137,6 +6187,19 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 
 	kvm_guest_exit();
 
+	if (vrr_info->enabled)
+		rdtscll(vrr_info->cur_exit_time);
+
+	/* Record and replay. Unload fpu every time after exit guest to avoid
+	 * frequent unloading when checkpoint or rollback.
+	 */
+	if (vcpu->guest_fpu_loaded) {
+		kvm_put_guest_xcr0(vcpu);
+		vcpu->guest_fpu_loaded = 0;
+		fpu_save_init(&vcpu->arch.guest_fpu);
+		__kernel_fpu_end();
+	}
+
 	preempt_enable();
 
 	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
@@ -6155,6 +6218,30 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	if (vcpu->arch.apic_attention)
 		kvm_lapic_sync_from_vapic(vcpu);
 
+	if (vrr_info->enabled) {
+		rr_trace_vm_exit(vcpu);
+		rr_clear_all_request(vrr_info);
+		r = rr_check_chunk(vcpu);
+		if (r == RR_CHUNK_ROLLBACK) {
+			/* Unload fpu from the hardware before we
+			 * rollback fpu, or kvm may override the value
+			 * we just rollback.
+			 */
+			rr_put_guest_fpu(vcpu);
+			rr_vcpu_rollback(vcpu);
+			rr_apic_reinsert_irq(vcpu);
+
+			if (unlikely(!rr_ctrl.enabled)) {
+				goto rr_disable;
+			}
+			goto restart;
+		}
+		if (unlikely(!rr_ctrl.enabled) && (r == RR_CHUNK_COMMIT)) {
+rr_disable:
+			/* Only after commit or rollback can we disable it */
+			rr_vcpu_disable(vcpu);
+		}
+	}
 	r = kvm_x86_ops->handle_exit(vcpu);
 	return r;
 

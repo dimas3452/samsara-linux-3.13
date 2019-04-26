@@ -31,6 +31,7 @@
 #include <linux/ftrace_event.h>
 #include <linux/slab.h>
 #include <linux/tboot.h>
+#include <linux/record_replay.h>
 #include "kvm_cache_regs.h"
 #include "x86.h"
 
@@ -43,6 +44,7 @@
 #include <asm/xcr.h>
 #include <asm/perf_event.h>
 #include <asm/kexec.h>
+#include <asm/logger.h>
 
 #include "trace.h"
 
@@ -2756,8 +2758,10 @@ static __init int setup_vmcs_config(struct vmcs_config *vmcs_conf)
 #endif
 	if (_cpu_based_exec_control & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) {
 		min2 = 0;
-		opt2 = SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES |
-			SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE |
+		/* Record and replay.
+		 * opt2 = SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES |
+		 */
+		opt2 = SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE |
 			SECONDARY_EXEC_WBINVD_EXITING |
 			SECONDARY_EXEC_ENABLE_VPID |
 			SECONDARY_EXEC_ENABLE_EPT |
@@ -4865,8 +4869,14 @@ static int handle_io(struct kvm_vcpu *vcpu)
 
 	++vcpu->stat.io_exits;
 
-	if (string || in)
+	if (string || in) {
+		if (vcpu->rr_info.enabled)
+			RR_LOG("3 %d %llx %d %llx\n", 0,
+			       vcpu->arch.regs[VCPU_REGS_RIP], 0,
+			       vcpu->arch.regs[VCPU_REGS_RCX]);
+
 		return emulate_instruction(vcpu, 0) == EMULATE_DONE;
+	}
 
 	port = exit_qualification >> 16;
 	size = (exit_qualification & 7) + 1;
@@ -5343,6 +5353,7 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	gpa_t gpa;
 	u32 error_code;
 	int gla_validity;
+	struct rr_vcpu_info *vrr_info = &vcpu->rr_info;
 
 	exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
 
@@ -5381,6 +5392,11 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	error_code |= (exit_qualification >> 3) & 0x1;
 
 	vcpu->arch.exit_qualification = exit_qualification;
+	if (vrr_info->enabled && (error_code & PFERR_WRITE_MASK) &&
+	    (error_code & PFERR_PRESENT_MASK)) {
+		++(vrr_info->exit_stat[RR_EXIT_REASON_WRITE_FAULT].counter);
+		vrr_info->is_write_pf_exit = true;
+	}
 
 	return kvm_mmu_page_fault(vcpu, gpa, error_code, NULL, 0);
 }
@@ -5560,6 +5576,18 @@ static int handle_pause(struct kvm_vcpu *vcpu)
 static int handle_invalid_op(struct kvm_vcpu *vcpu)
 {
 	kvm_queue_exception(vcpu, UD_VECTOR);
+	return 1;
+}
+
+/* Preemption handler for record and replay */
+static int handle_preemption(struct kvm_vcpu *vcpu)
+{
+	/* We need the preemption to kick the vcpu out periodly, so we need to
+	 * do nothing here but reset the timer value and return 1 to let the
+	 * guest resume.
+	 * We will reset the timer value each time we commit or rollback a
+	 * chunk.
+	 */
 	return 1;
 }
 
@@ -6446,6 +6474,7 @@ static int (*const kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_MWAIT_INSTRUCTION]	      = handle_invalid_op,
 	[EXIT_REASON_MONITOR_INSTRUCTION]     = handle_invalid_op,
 	[EXIT_REASON_INVEPT]                  = handle_invept,
+	[EXIT_REASON_PREEMPTION_TIMER]        = handle_preemption,
 };
 
 static const int kvm_vmx_max_exit_handlers =
@@ -8550,6 +8579,53 @@ static struct kvm_x86_ops vmx_x86_ops = {
 	.handle_external_intr = vmx_handle_external_intr,
 };
 
+/* Record and replay */
+static void vmx_rr_ape_setup(u32 timer_value)
+{
+	/* Setup preemption timer */
+	vmcs_write32(VMX_PREEMPTION_TIMER_VALUE, timer_value);
+	vmcs_set_bits(PIN_BASED_VM_EXEC_CONTROL,
+		      PIN_BASED_VMX_PREEMPTION_TIMER);
+	vmcs_set_bits(VM_EXIT_CONTROLS, VM_EXIT_SAVE_VMX_PREEMPTION_TIMER);
+	RR_DLOG(INIT, "timer_value=%d", timer_value);
+}
+
+static void vmx_rr_ape_clear(void)
+{
+	vmcs_clear_bits(PIN_BASED_VM_EXEC_CONTROL,
+			PIN_BASED_VMX_PREEMPTION_TIMER);
+	vmcs_clear_bits(VM_EXIT_CONTROLS, VM_EXIT_SAVE_VMX_PREEMPTION_TIMER);
+}
+
+static u32 vmx_rr_get_exit_reason(struct kvm_vcpu *vcpu)
+{
+	return to_vmx(vcpu)->exit_reason;
+}
+
+static void vmx_rr_trace_vm_exit(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct rr_vcpu_info *vrr_info = &vcpu->rr_info;
+	u32 exit_reason = vmx->exit_reason;
+
+	++(vrr_info->nr_exits);
+	vrr_info->exit_reason = exit_reason;
+	vrr_info->is_write_pf_exit = false;
+	if (likely(exit_reason < RR_EXIT_REASON_MAX))
+		++(vrr_info->exit_stat[exit_reason].counter);
+	else
+		RR_ERR("error: vcpu=%d exit_reason=%u beyonds the range",
+		       vcpu->vcpu_id, exit_reason);
+}
+
+static struct rr_ops vmx_rr_ops = {
+	.ape_vmx_setup = vmx_rr_ape_setup,
+	.tlb_flush = vmx_flush_tlb,
+	.ape_vmx_clear = vmx_rr_ape_clear,
+	.get_vmx_exit_reason = vmx_rr_get_exit_reason,
+	.trace_vm_exit = vmx_rr_trace_vm_exit,
+};
+
 static int __init vmx_init(void)
 {
 	int r, i, msr;
@@ -8623,6 +8699,8 @@ static int __init vmx_init(void)
 		     __alignof__(struct vcpu_vmx), THIS_MODULE);
 	if (r)
 		goto out7;
+
+	rr_init(&vmx_rr_ops);
 
 #ifdef CONFIG_KEXEC
 	rcu_assign_pointer(crash_vmclear_loaded_vmcss,
